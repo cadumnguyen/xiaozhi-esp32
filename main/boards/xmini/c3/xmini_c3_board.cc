@@ -15,8 +15,117 @@
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
+#include <cJSON.h>
+#include <esp_log.h>
+#include <string>
 
 #define TAG "XminiC3Board"
+namespace {
+ 
+const char* kWeatherToolTag = "WeatherTool";
+ 
+// Gửi GET request và trả về toàn bộ nội dung response dạng string
+esp_err_t HttpGetToString(const char* url, std::string& out) {
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 8000;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+ 
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        return ESP_FAIL;
+    }
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(kWeatherToolTag, "Khong ket noi duoc: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
+    }
+    esp_http_client_fetch_headers(client);
+ 
+    char buf[512];
+    int read_len;
+    out.clear();
+    while ((read_len = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
+        out.append(buf, read_len);
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return ESP_OK;
+}
+ 
+// Chuyển mã thời tiết WMO của Open-Meteo thành mô tả ngắn tiếng Việt
+std::string WeatherCodeToText(int code) {
+    if (code == 0) return "troi quang";
+    if (code <= 3) return "co may";
+    if (code <= 48) return "suong mu";
+    if (code <= 57) return "mua phun";
+    if (code <= 67) return "mua";
+    if (code <= 77) return "tuyet";
+    if (code <= 82) return "mua rao";
+    if (code <= 86) return "mua tuyet";
+    if (code <= 99) return "giong bao";
+    return "khong ro";
+}
+ 
+// Lấy vị trí hiện tại theo IP + thời tiết từ Open-Meteo, trả về 1 câu mô tả
+std::string GetWeatherReport() {
+    // 1. Xac dinh vi tri qua IP cong cong (khong can GPS/toa do)
+    std::string geo;
+    if (HttpGetToString("http://ip-api.com/json/?fields=lat,lon,city", geo) != ESP_OK) {
+        return "Khong lay duoc vi tri thiet bi, kiem tra ket noi mang.";
+    }
+    cJSON* geo_json = cJSON_Parse(geo.c_str());
+    if (geo_json == nullptr) {
+        return "Loi doc du lieu vi tri.";
+    }
+    cJSON* lat_item = cJSON_GetObjectItem(geo_json, "lat");
+    cJSON* lon_item = cJSON_GetObjectItem(geo_json, "lon");
+    cJSON* city_item = cJSON_GetObjectItem(geo_json, "city");
+    if (lat_item == nullptr || lon_item == nullptr) {
+        cJSON_Delete(geo_json);
+        return "Khong doc duoc toa do vi tri.";
+    }
+    double lat = lat_item->valuedouble;
+    double lon = lon_item->valuedouble;
+    std::string city = (city_item != nullptr && city_item->valuestring != nullptr)
+                            ? city_item->valuestring : "khu vuc cua ban";
+    cJSON_Delete(geo_json);
+ 
+    // 2. Goi Open-Meteo lay thoi tiet hien tai theo toa do vua tim duoc
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+             "&current=temperature_2m,relative_humidity_2m,weather_code",
+             lat, lon);
+ 
+    std::string weather;
+    if (HttpGetToString(url, weather) != ESP_OK) {
+        return "Khong lay duoc du lieu thoi tiet.";
+    }
+    cJSON* w_json = cJSON_Parse(weather.c_str());
+    if (w_json == nullptr) {
+        return "Loi doc du lieu thoi tiet.";
+    }
+    cJSON* current = cJSON_GetObjectItem(w_json, "current");
+    if (current == nullptr) {
+        cJSON_Delete(w_json);
+        return "Du lieu thoi tiet khong hop le.";
+    }
+    double temp = cJSON_GetObjectItem(current, "temperature_2m")->valuedouble;
+    int humidity = cJSON_GetObjectItem(current, "relative_humidity_2m")->valueint;
+    int code = cJSON_GetObjectItem(current, "weather_code")->valueint;
+    cJSON_Delete(w_json);
+ 
+    char result[192];
+    snprintf(result, sizeof(result), "%s: %s, %.1f do C, do am %d%%",
+             city.c_str(), WeatherCodeToText(code).c_str(), temp, humidity);
+    return std::string(result);
+}
+ 
+}  // namespace
 
 class XminiC3Board : public WifiBoard {
 private:
@@ -167,6 +276,21 @@ private:
     void InitializeTools() {
         press_to_talk_tool_ = new PressToTalkMcpTool();
         press_to_talk_tool_->Initialize();
+    auto& mcp_server = McpServer::GetInstance();
+    mcp_server.AddTool(
+        "self.get_weather",
+        "Lay thoi tiet hien tai theo vi tri IP cua thiet bi va hien len man hinh.",
+        PropertyList(),
+        [this](const PropertyList&) -> ReturnValue {
+            std::string report = GetWeatherReport();
+            // Hien thi len man OLED - neu dong nay bao loi, kiem tra ten ham
+            // dung trong main/display/display.h cua repo (co the la SetStatus,
+            // ShowNotification, SetChatMessage... tuy phien ban)
+            if (GetDisplay() != nullptr) {
+                GetDisplay()->SetChatMessage("system", report.c_str());
+            }
+            return report;  // AI se doc cau nay bang giong noi
+        });
     }
 
 public:
