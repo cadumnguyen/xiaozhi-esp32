@@ -1083,6 +1083,8 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp_http_client
+                        json
                         xiaozhi-fonts
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
